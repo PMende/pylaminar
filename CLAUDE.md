@@ -110,23 +110,82 @@ class TaskMeta(type):
     creation, injects shared instrumentation."""
 
 class Task(metaclass=TaskMeta):
-    """Params: pydantic model. run(): domain logic. Declares upstream
-    artifact dependencies for DAG construction."""
+    """Params: pydantic model. run(): domain logic. Upstream dependencies
+    are declared at the parameter level: a Params field is bound to a
+    FieldRef pointing at a specific field of an upstream Task's declared
+    output Artifact, rather than to the whole upstream Task or Artifact."""
 
 class Flow(metaclass=FlowMeta):
-    """A named, versioned collection of Tasks with an explicit or inferred
-    dependency graph."""
+    """A named, versioned collection of Tasks. The dependency graph is
+    derived by tracing FieldRef bindings across all Tasks' Params at
+    flow-construction time — not declared separately, and not inferred by
+    artifact type-matching."""
 
 class Artifact(metaclass=ArtifactMeta):
     """A typed, versioned unit of data I/O — backed by Iceberg for tabular
-    data, fsspec-addressable paths otherwise."""
+    data, fsspec-addressable paths otherwise. Exposes its declared fields
+    as symbolic FieldRefs at flow-definition time (before the producing
+    Task has run), and as concrete values at execution time."""
+
+class FieldRef:
+    """A definition-time-only symbolic reference to a single field of an
+    upstream Task's declared output Artifact — e.g. `TaskA.output.task_date`,
+    used when wiring `TaskB.Params(upstream_task_date=TaskA.output.task_date)`.
+    Captures (producing_task, artifact_type, field_name, field_type) so
+    FlowMeta can validate field-type compatibility against the receiving
+    Params field at class/flow-construction time (Principle 5), then
+    resolve the reference into a DAG edge and, at execution time, the
+    field's concrete runtime value."""
+
+class MappedTask(Task, metaclass=TaskMeta):
+    """A Task that fans out into one instance of `inner` per entry of a
+    keyed collection (`items`). `items` binds to a FieldRef whose declared
+    type is `Mapping[K, T]` — or `Sequence[T]`, accepted as sugar and
+    auto-keyed `0..N-1` — so each fan-out instance has a stable identity
+    across runs. `.output` is the aggregate Artifact: each field is the
+    per-instance output field gathered across all keys, so a downstream
+    Task binds to it with an ordinary FieldRef (many:1 / gather — e.g.
+    `Summarize.Params(all_counts=DailyLoad.output.row_count)`).
+
+    `.keys` is a second, definition-time-only symbolic handle (distinct
+    from `.output`) usable only as another MappedTask's `items=` binding.
+    Binding `items` to `SomeMappedTask.keys` makes the new MappedTask a
+    *co-map* of `SomeMappedTask`: one `inner` instance per shared key
+    (many:many), each parameterized element-wise off the producing
+    MappedTask's per-key output rather than the gathered aggregate.
+    Whether a FieldRef into a MappedTask's `.output` resolves as the full
+    gather or as one key's value is determined structurally — by whether
+    the referencing Task is itself co-mapping that same producing
+    MappedTask — not by new FieldRef syntax.
+
+    `MappedTaskMeta` validates only what's knowable at definition time:
+    element-type compatibility, and, for co-mapping, that `items` is
+    bound to literally the same producing MappedTask's `.keys` handle
+    (not just a matching key type). Actual cardinality and key values are
+    a runtime fact — resolved by the scheduler once the producing task
+    materializes `items` — and fan-out is lockstep only for v1: a
+    co-mapped MappedTask cannot begin expanding until every instance of
+    the MappedTask it co-maps has completed. See Decision Log and Open
+    Questions."""
 ```
 
-Key open design question: should task dependencies be declared explicitly
-(constructor references to upstream tasks) or inferred from artifact
-type-matching between producers and consumers? Both are viable; this has
-real implications for the graph layer and deserves a dedicated design
-discussion before locking in.
+**Resolved:** task dependencies are declared at the parameter level via
+`FieldRef` bindings, not via whole-task explicit wiring or artifact
+type-matching inference. This avoids the ambiguity that whole-artifact
+type-matching would hit (multiple tasks emitting the same `Artifact`
+subtype) since each reference names one concrete upstream task + field,
+while staying terser than whole-task wiring since no separate
+`depends_on=[...]` declaration is needed — the graph is traced from the
+`FieldRef` bindings themselves. See Decision Log.
+
+**Resolved:** fan-out/mapped task execution — the 1:many, many:1, and
+many:many cardinalities (1:1 is the base `FieldRef` case above) — is
+handled by a dedicated `MappedTask` subclass of `Task`, not by allowing
+a plain `Task` to be invoked multiple times implicitly. `FieldRef`
+syntax itself doesn't change between the aggregate (many:1) and
+per-instance (many:many) cases; resolution mode is structural, per
+`MappedTask`'s docstring above. See Decision Log. The scheduler-side
+mechanics of runtime DAG expansion remain open — see Open Questions.
 
 ## Development Conventions
 
@@ -237,25 +296,88 @@ sessions (and future me) have the "why," not just the "what."
 - 2026-07-12: Confirmed the "Python 3.13+" floor language as-is; the
   "no more than 3 years old" rule is upkept manually as part of normal
   CLAUDE.md maintenance rather than reworded to be version-agnostic.
+- 2026-07-12: Package name settled as `pylaminar` (matches the existing
+  repo name).
+- 2026-07-12: Graph library settled as `rustworkx` over `networkx`,
+  per the "minimal but performant" requirement in Core design bets.
+- 2026-07-12: Dependency inference model settled as parameter-level
+  `FieldRef` bindings (a `Task.Params` field bound to a specific field of
+  an upstream `Task`'s output `Artifact`, e.g.
+  `TaskB.Params(upstream_task_date=TaskA.output.task_date)`), rather than
+  whole-task explicit wiring or whole-artifact type-matching inference.
+  Precedent: Flyte's `Promise` objects and Kubeflow Pipelines v2's DSL use
+  the same symbolic-reference-at-definition-time pattern. Rationale:
+  avoids the ambiguity whole-artifact type-matching would hit when
+  multiple tasks emit the same `Artifact` subtype, without the
+  boilerplate of a separate `depends_on=[...]` declaration — the DAG
+  edge is traced from the binding itself. See Domain Model Sketch for the
+  `FieldRef` shape. Open follow-up: `FieldRef` resolution under
+  fan-out/mapped task execution, tracked in Open Questions.
+- 2026-07-12: Settled the fan-out/mapped task execution model (closing
+  the `FieldRef`-under-fan-out follow-up above), covering all cardinality
+  cases beyond the base 1:1 `FieldRef` binding:
+  - A dedicated `MappedTask` subclass of `Task` (metaclass-backed like
+    every other core primitive, per Principle 2) represents fan-out,
+    rather than allowing a plain `Task` to be invoked multiple times
+    implicitly.
+  - **Naming:** `MappedTask`, not `ContainerTask` (collides with the
+    OS/Docker-container reading, which is the wrong first association in
+    an AWS/S3-flavored codebase) or `TaskCollection` (reads as a
+    collection of Task objects rather than as a Task itself, which is a
+    mismatch since it must subclass `Task` and participate in the DAG
+    like any other Task). `MappedTask` matches the term used by
+    comparable systems (Flyte's `map_task`, AWS Step Functions' `Map`
+    state, Prefect's `.map()`).
+  - **Fan-out source:** `items` is canonically a keyed `Mapping[K, T]`;
+    `Sequence[T]` is accepted as sugar, auto-keyed `0..N-1`. Stable keys
+    are required for many:many correspondence (below) to survive
+    retries/re-runs without an index-only fan-out silently breaking under
+    upstream reordering.
+  - **many:1 (gather):** a downstream `Task` binds to a `MappedTask`'s
+    `.output` field with an ordinary `FieldRef`; it resolves to the
+    aggregate collection across all keys. No new syntax.
+  - **many:many (co-map):** a `MappedTask` can bind `items` to another
+    `MappedTask`'s `.keys` — a second, definition-time-only symbolic
+    handle distinct from `.output` — making it a co-map: one `inner`
+    instance per shared key, parameterized element-wise. Whether a
+    `FieldRef` into a `MappedTask`'s `.output` resolves as the full
+    gather or as one key's value is determined structurally (is the
+    referencing Task itself co-mapping that same producing `MappedTask`?
+    ), not by new `FieldRef` syntax — kept deliberately symmetric with
+    the many:1 case above.
+  - **Scheduling:** lockstep only for v1 — a co-mapped `MappedTask`
+    cannot begin expanding until every instance of the `MappedTask` it
+    co-maps has completed. No per-key pipelining/streaming expansion.
+    Chosen over pipelining to avoid key-level dependency tracking in the
+    scheduler for v1; revisit only if a concrete workload needs it.
+  - **Validation scoping:** `MappedTaskMeta` validates element-type
+    compatibility and (for co-mapping) keyspace identity — the same
+    producing `MappedTask`, not just a matching key type — at definition
+    time. Actual cardinality and key values are irreducibly a runtime
+    fact (no orchestrator can know them earlier); the scheduler-side
+    mechanics of expanding the runtime DAG once `items` materializes are
+    deferred, tracked in Open Questions under Execution engine scope.
+  - See Domain Model Sketch for the `MappedTask` shape.
 
 ## Open Questions
 
 Track unresolved design decisions here; remove once settled and reflected
 in the sections above.
 
-1. **Graph library choice.** Candidates include `rustworkx` (fast,
-   minimal, Rust-backed, no hard networkx dependency) vs. `networkx`
-   (ubiquitous, larger surface area, pure Python, slower at scale). Given
-   the "minimal but performant" requirement, `rustworkx` is the leading
-   candidate — confirm before adding as a dependency.
-2. **Dependency inference model.** Explicit task wiring vs. artifact
-   type-matching inference (see Domain Model Sketch above).
-3. **Execution engine scope.** Is a distributed/async scheduler in scope
+1. **Execution engine scope.** Is a distributed/async scheduler in scope
    for v1, or does v1 target single-process sequential/threaded execution
-   with the engine designed to be swapped later?
-4. **Versioning strategy for flows and artifacts.** Needed for
+   with the engine designed to be swapped later? Now also gates the
+   `MappedTask` runtime-expansion mechanics: the static, class-level
+   graph `FlowMeta` builds at import time can't contain concrete fan-out
+   node instances (their count isn't known until a `MappedTask`'s
+   `items` materializes at runtime — see Decision Log), so the scheduler
+   needs some form of runtime DAG mutation. Open: does this live as a
+   second, run-scoped graph that gets nodes appended as each
+   `MappedTask` expands, or as an expansion-in-place of the static graph
+   (placeholder node → N concrete nodes)? Deferred until engine scope
+   itself is settled, since the answer likely depends on whether
+   execution is sequential or concurrent.
+2. **Versioning strategy for flows and artifacts.** Needed for
    reproducibility guarantees against Iceberg's native table versioning/
    time-travel — decide how much the orchestrator reimplements vs. defers
    to Iceberg.
-5. **Package name.** Placeholder `<pkg_name>` used throughout — needs a
-   real name before scaffolding begins in earnest.
